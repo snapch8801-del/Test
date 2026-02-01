@@ -1034,6 +1034,8 @@ function restartLiveIfNeeded(){
 // ربط online/offline مع Live
 window.addEventListener("online", ()=> { if(isLiveEnabled()) startLiveListener(); });
 window.addEventListener("offline", ()=> { if(isLiveEnabled()) stopLiveListener(); });
+
+/* =========================================================
    ✅ Stage 2: دمج ذكي + حماية تعارض (ETag / If-Match)
    - نستعمل Conditional REST Requests في Realtime Database
    - نقرأ ETag عبر X-Firebase-ETag: true
@@ -1532,7 +1534,7 @@ async function initialLoad(){
     setSyncState("fail");
     // fallback: المحلي
     data = local;
-    if(!silent) try{ showToast("تعذر جلب البيانات من Firebase", "تم تحميل النسخة المحلية", "warn"); }catch{}
+    try{ showToast("تعذر جلب البيانات من Firebase", "تم تحميل النسخة المحلية", "warn"); }catch{}
     return;
   }
 }
