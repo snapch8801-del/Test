@@ -1034,8 +1034,6 @@ function restartLiveIfNeeded(){
 // ربط online/offline مع Live
 window.addEventListener("online", ()=> { if(isLiveEnabled()) startLiveListener(); });
 window.addEventListener("offline", ()=> { if(isLiveEnabled()) stopLiveListener(); });
-
-/* =========================================================
    ✅ Stage 2: دمج ذكي + حماية تعارض (ETag / If-Match)
    - نستعمل Conditional REST Requests في Realtime Database
    - نقرأ ETag عبر X-Firebase-ETag: true
@@ -1534,7 +1532,7 @@ async function initialLoad(){
     setSyncState("fail");
     // fallback: المحلي
     data = local;
-    try{ showToast("تعذر جلب البيانات من Firebase", "تم تحميل النسخة المحلية", "warn"); }catch{}
+    if(!silent) try{ showToast("تعذر جلب البيانات من Firebase", "تم تحميل النسخة المحلية", "warn"); }catch{}
     return;
   }
 }
@@ -2285,13 +2283,13 @@ $("actCopyEmail").onclick = async ()=>{
 };
 
 /* ===== Sync modal buttons ===== */
-$("syncBackupDownload").onclick = ()=> syncPushNow();
-$("syncRestorePick").onclick = ()=> syncPullNow();
-
+$("syncBackupDownload").onclick = ()=>{ try{ const inp=$("roomCode"); if(inp) setRoomCode(inp.value); }catch{} syncPushNow(); };
+$("syncRestorePick").onclick = ()=>{ try{ const inp=$("roomCode"); if(inp) setRoomCode(inp.value); }catch{} syncPullNow(); };
 // Live Sync toggle (Stage 3)
 const __liveBtn = document.getElementById("liveToggleBtn");
 if(__liveBtn){
   __liveBtn.onclick = ()=>{
+    try{ const inp=$("roomCode"); if(inp) setRoomCode(inp.value); }catch{}
     const on = isLiveEnabled();
     setLiveEnabled(!on);
   };
