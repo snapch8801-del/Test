@@ -730,12 +730,21 @@ tr.expiring-row td:first-child{ box-shadow: inset 4px 0 0 rgba(245,158,11,.85); 
     </div>
 
     <div class="modalBody">
-      <div class="syncSectionTitle">📦 النسخ والاسترجاع</div>
+      <div class="syncSectionTitle">👥 المزامنة المشتركة</div>
+      <div class="field" style="margin-bottom:12px">
+        <label>كود المجموعة (Room)</label>
+        <input id="roomCode" placeholder="مثال: main / team1">
+      </div>
+      <div class="note" style="margin-top:0;margin-bottom:12px">
+        <b>نفس الكود = نفس البيانات</b> بين كل الأجهزة اللي تستخدمه.
+      </div>
+
+      <div class="syncSectionTitle">☁️ Firebase (سحابة)</div>
 
       <div class="syncGrid">
-        <button class="syncBtn" id="syncBackupDownload" type="button">💾 Backup (تنزيل)</button>
-        <button class="syncBtn" id="syncBackupShare" type="button">📤 مشاركة Backup</button>
-        <button class="syncBtn" id="syncRestorePick" type="button">📥 Restore (اختيار ملف)</button>
+        <button class="syncBtn" id="syncBackupDownload" type="button">⬆️ مزامنة الآن (رفع)</button>
+        <button class="syncBtn" id="syncBackupShare" type="button">📤 مشاركة backup.json</button>
+        <button class="syncBtn" id="syncRestorePick" type="button">⬇️ جلب من السحابة</button>
       </div>
 
       <div class="syncHr"></div>
@@ -747,8 +756,8 @@ tr.expiring-row td:first-child{ box-shadow: inset 4px 0 0 rgba(245,158,11,.85); 
       </div>
 
       <div class="syncNote">
-        <b>ملاحظة:</b> المزامنة بدون سيرفر: أنشئ ملف <b>backup.json</b> ثم شاركه/ارفَعْه إلى Drive/Dropbox،
-        وعند الاسترجاع اختر الملف من جهازك.
+        <b>ملاحظة:</b> هذه <b>مزامنة مشتركة</b> عبر Firebase. إذا كانت قواعد قاعدة البيانات تتطلب تسجيل الدخول، افتح <b>👤 حساب</b> وسجّل دخول.
+        إذا عملت أوفلاين سيتم الإرسال تلقائياً عند رجوع الإنترنت.
       </div>
     </div>
 
@@ -859,7 +868,61 @@ window.addEventListener('unhandledrejection', (e)=>{
 
 const $ = (id)=>document.getElementById(id);
 const FIREBASE_URL  = "https://dattta-6f497-default-rtdb.firebaseio.com";
-const FIREBASE_PATH = "subscriptions"; // مسار التخزين المشترك في Firebase
+
+// ✅ مزامنة مشتركة (Room) — نفس الكود = نفس البيانات
+const ROOM_KEY = "subs_shared_room_v1";
+function sanitizeRoomCode(code){
+  return (code||"").toString().trim().toLowerCase()
+    .replace(/[^a-z0-9_-]/g,"")
+    .slice(0, 32) || "main";
+}
+function getRoomCode(){
+  try{ return sanitizeRoomCode(localStorage.getItem(ROOM_KEY)); }catch{ return "main"; }
+}
+function setRoomCode(v){
+  try{ localStorage.setItem(ROOM_KEY, sanitizeRoomCode(v)); }catch{}
+}
+function getFirebasePath(){
+  return `rooms/${getRoomCode()}/subscriptions`;
+}
+/* =========================================================
+   ✅ Stage 2: دمج ذكي + حماية تعارض (ETag / If-Match)
+   - نستعمل Conditional REST Requests في Realtime Database
+   - نقرأ ETag عبر X-Firebase-ETag: true
+   - ونكتب بشرط if-match لتفادي "آخر كتابة تمسح التعديلات"
+========================================================= */
+const CLOUD_ETAG_PREFIX = "subs_cloud_etag_v2_";
+const DEVICE_ID_KEY = "subs_device_id_v1";
+
+function getDeviceId(){
+  try{
+    let id = localStorage.getItem(DEVICE_ID_KEY);
+    if(id) return id;
+    id = "dev_" + Date.now().toString(36) + "_" + Math.random().toString(16).slice(2,10);
+    localStorage.setItem(DEVICE_ID_KEY, id);
+    return id;
+  }catch{
+    return "dev_" + Date.now().toString(36);
+  }
+}
+
+function getEtagKey(){
+  return CLOUD_ETAG_PREFIX + getRoomCode();
+}
+function loadCloudEtag(){
+  try{ return localStorage.getItem(getEtagKey()) || null; }catch{ return null; }
+}
+function saveCloudEtag(etag){
+  try{
+    const k = getEtagKey();
+    if(!etag) localStorage.removeItem(k);
+    else localStorage.setItem(k, etag);
+  }catch{}
+}
+
+// آخر ETag معروف للسحابة (لكل Room)
+let cloudEtag = loadCloudEtag();
+
 
 const LOCAL_BACKUP_KEY   = "subs_local_backup_v3";
 const PENDING_SYNC_KEY   = "subs_pending_sync_v1";
@@ -923,49 +986,274 @@ function loadLocalBackup(){
   try{
     const raw = localStorage.getItem(LOCAL_BACKUP_KEY);
     const j = raw ? JSON.parse(raw) : null;
-    return Array.isArray(j) ? j : [];
+    const rows = Array.isArray(j) ? j : [];
+    return rows.map(normalizeRowForMerge).filter(Boolean);
   }catch{ return []; }
 }
 
-async function firebasePull(){
-  const url = `${FIREBASE_URL}/${FIREBASE_PATH}.json`;
-  const res = await fetchWithTimeout(url, {}, 25000);
-  if(!res.ok){
-    const txt = await res.text().catch(()=> "");
-    throw new Error(`Firebase pull failed (${res.status}) ${txt}`.trim());
-  }
-  const json = await res.json();
-  // نخزن "مصفوفة" بشكل مباشر في المسار
-  return Array.isArray(json) ? json : [];
+/* =========================================================
+   ✅ Stage 2 Merge Helpers
+   - دمج حسب (id) ثم إزالة التكرار حسب (email)
+   - حل التعارض: آخر updatedAt يفوز (Last-write-wins per record)
+   - حذف: نستخدم tombstone داخل السجل (deleted=true)
+========================================================= */
+
+function _normEmailSafe(e){ return (e||"").toString().trim().toLowerCase(); }
+
+function _ensureUpdatedAt(n){
+  const x = Number(n);
+  return Number.isFinite(x) && x >= 0 ? x : 0;
 }
 
-async function firebasePushOnce(){
-  const url = `${FIREBASE_URL}/${FIREBASE_PATH}.json`;
+function _newId(){
+  return Date.now()+"_"+Math.random().toString(16).slice(2);
+}
+
+function normalizeRowForMerge(r){
+  if(!r || typeof r !== "object") return null;
+  const out = { ...r };
+  out.id = out.id || _newId();
+  out.email = _normEmailSafe(out.email);
+  out.deleted = !!(out.deleted || out._deleted);
+  out.updatedAt = _ensureUpdatedAt(out.updatedAt || out._updatedAt || 0);
+
+  // بعض النسخ القديمة قد تخزن السعر/الأشهر كنص
+  if(out.months != null){
+    const m = Number(out.months);
+    out.months = (Number.isFinite(m) && m>0) ? m : 1;
+  }
+  if(out.price != null){
+    const p = Number(out.price);
+    out.price = Number.isFinite(p) ? p : 0;
+  }
+  return out;
+}
+
+function mergeRows(localRows, remoteRows){
+  const A = Array.isArray(localRows) ? localRows : [];
+  const B = Array.isArray(remoteRows) ? remoteRows : [];
+
+  // 1) تجميع حسب id (آخر تحديث يفوز)
+  const byId = new Map();
+  const take = (row)=>{
+    const r = normalizeRowForMerge(row);
+    if(!r) return;
+    const prev = byId.get(r.id);
+    if(!prev){ byId.set(r.id, r); return; }
+
+    const a = _ensureUpdatedAt(prev.updatedAt);
+    const b = _ensureUpdatedAt(r.updatedAt);
+
+    if(b > a) { byId.set(r.id, r); return; }
+    if(b < a) return;
+
+    // tie-break: غير محذوف يفوز
+    if(!!prev.deleted && !r.deleted) { byId.set(r.id, r); return; }
+  };
+
+  A.forEach(take);
+  B.forEach(take);
+
+  let rows = Array.from(byId.values());
+
+  // 2) إزالة التكرار حسب الإيميل (إن وُجد)
+  const byEmail = new Map(); // email -> winnerId
+  for(const r of rows){
+    if(!r.email) continue;
+    const curWinnerId = byEmail.get(r.email);
+    if(!curWinnerId){ byEmail.set(r.email, r.id); continue; }
+    const w = rows.find(x=>x.id===curWinnerId);
+    if(!w) { byEmail.set(r.email, r.id); continue; }
+
+    const aw = _ensureUpdatedAt(w.updatedAt);
+    const ar = _ensureUpdatedAt(r.updatedAt);
+
+    const rBetter = (ar > aw) || (ar === aw && !!w.deleted && !r.deleted);
+    if(rBetter){
+      byEmail.set(r.email, r.id);
+    }
+  }
+
+  // اجعل الخاسرين tombstone (deleted=true) مع updatedAt >= الفائز
+  const winnerByEmail = new Map();
+  for(const [email, id] of byEmail.entries()){
+    winnerByEmail.set(email, id);
+  }
+
+  rows = rows.map(r=>{
+    if(!r.email) return r;
+    const winId = winnerByEmail.get(r.email);
+    if(!winId || winId === r.id) return r;
+
+    // هذا مكرر: نحوله لمحذوف "توضيحي"
+    const win = rows.find(x=>x.id===winId);
+    const winAt = win ? _ensureUpdatedAt(win.updatedAt) : _ensureUpdatedAt(r.updatedAt);
+    return {
+      ...r,
+      deleted: true,
+      updatedAt: Math.max(_ensureUpdatedAt(r.updatedAt), winAt),
+      _dupeOf: winId
+    };
+  });
+
+  // 3) ترتيب: الأحدث أولاً (مثل unshift في الإضافة)
+  rows.sort((x,y)=> _ensureUpdatedAt(y.updatedAt) - _ensureUpdatedAt(x.updatedAt));
+
+  return rows;
+}
+
+function activeOnly(list){
+  return (Array.isArray(list) ? list : []).filter(r=> !(r && (r.deleted || r._deleted)) );
+}
+
+function buildCloudPayload(rows){
+  // نخزن شكل موحّد في السحابة (v2) مع rows + meta
+  return {
+    v: 2,
+    updatedAt: Date.now(),
+    updatedBy: getDeviceId(),
+    rows: Array.isArray(rows) ? rows : []
+  };
+}
+
+function extractRowsFromCloud(json){
+  if(json == null) return [];
+  if(Array.isArray(json)) return json;
+  if(typeof json === "object"){
+    if(Array.isArray(json.rows)) return json.rows;
+    if(Array.isArray(json.data)) return json.data; // fallback
+  }
+  return [];
+}
+
+async function firebaseGetJsonWithEtag(){
+  const path = getFirebasePath();
+
+  // ✅ إن كان المستخدم مسجل دخول: أرسل الـ idToken (ينفع مع قواعد auth != null)
+  const token = (currentUser && currentUser.getIdToken) ? await currentUser.getIdToken().catch(()=>null) : null;
+  const authQ = token ? `?auth=${encodeURIComponent(token)}` : "";
+
+  const url = `${FIREBASE_URL}/${path}.json${authQ}`;
   const res = await fetchWithTimeout(url, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data)
+    headers: {
+      "X-Firebase-ETag": "true",
+      "Cache-Control": "no-store"
+    }
   }, 25000);
 
   if(!res.ok){
     const txt = await res.text().catch(()=> "");
+    if(res.status===401 || res.status===403){
+      throw new Error(`غير مصرح. افتح (👤 حساب) وسجّل دخول أو عدّل قواعد Firebase. (${res.status}) ${txt}`.trim());
+    }
+    throw new Error(`Firebase pull failed (${res.status}) ${txt}`.trim());
+  }
+
+  const etag = res.headers.get("ETag") || res.headers.get("etag") || null;
+  const json = await res.json();
+  return { json, etag };
+}
+
+async function firebasePull(){
+  const {json, etag} = await firebaseGetJsonWithEtag();
+
+  // ✅ خزّن ETag محليًا لنفس الـ Room
+  cloudEtag = etag || null;
+  saveCloudEtag(cloudEtag);
+
+  const rows = extractRowsFromCloud(json);
+  // ✅ نظّف/طبّع السجلات (updatedAt / deleted / email)
+  return (rows||[]).map(normalizeRowForMerge).filter(Boolean);
+}
+
+async function firebasePushOnce(){
+  const path = getFirebasePath();
+
+  // ✅ إن كان المستخدم مسجل دخول: أرسل الـ idToken (ينفع مع قواعد auth != null)
+  const token = (currentUser && currentUser.getIdToken) ? await currentUser.getIdToken().catch(()=>null) : null;
+  const authQ = token ? `?auth=${encodeURIComponent(token)}` : "";
+
+  const url = `${FIREBASE_URL}/${path}.json${authQ}`;
+
+  // إذا لا نملك ETag بعد: جرّب null_etag (سيفشل بـ 412 إن كانت هناك بيانات) ثم ندمج ونُعيد المحاولة
+  const ifMatch = cloudEtag || "null_etag";
+
+  const payload = buildCloudPayload(Array.isArray(data) ? data : []);
+
+  const res = await fetchWithTimeout(url, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Firebase-ETag": "true",
+      "if-match": ifMatch
+    },
+    body: JSON.stringify(payload)
+  }, 25000);
+
+  if(!res.ok){
+    const txt = await res.text().catch(()=> "");
+    if(res.status===401 || res.status===403){
+      throw new Error(`غير مصرح. افتح (👤 حساب) وسجّل دخول أو عدّل قواعد Firebase. (${res.status}) ${txt}`.trim());
+    }
+
+    // ✅ تعارض ETag (هناك تعديل من جهاز آخر)
+    if(res.status === 412){
+      let remoteJson = null;
+      try{ remoteJson = txt ? JSON.parse(txt) : null; }catch{ remoteJson = null; }
+      const remoteEtag = res.headers.get("ETag") || res.headers.get("etag") || null;
+
+      const err = new Error("ETag mismatch (merge required)");
+      err.code = "etag_mismatch";
+      err.remote = remoteJson;
+      err.etag = remoteEtag;
+      throw err;
+    }
+
     throw new Error(`Firebase push failed (${res.status}) ${txt}`.trim());
+  }
+
+  // ✅ تحديث ETag بعد نجاح الكتابة (إذا أُعيد)
+  const newEtag = res.headers.get("ETag") || res.headers.get("etag") || null;
+  if(newEtag){
+    cloudEtag = newEtag;
+    saveCloudEtag(newEtag);
   }
 }
 
-// محاولة دفع مع إعادة محاولة بسيطة
-async function firebasePushRetry(maxTries=3){
+// محاولة دفع مع إعادة محاولة + دمج عند التعارض
+async function firebasePushRetry(maxTries=4){
   let lastErr = null;
+
   for(let i=1;i<=maxTries;i++){
     try{
       await firebasePushOnce();
       return true;
     }catch(e){
       lastErr = e;
+
+      // ✅ تعارض: اسحب النسخة السحابية (من body) وادمج ثم أعد المحاولة
+      if(e && e.code === "etag_mismatch"){
+        const remoteRows = (extractRowsFromCloud(e.remote)||[]).map(normalizeRowForMerge).filter(Boolean);
+        const remoteEtag = e.etag || null;
+
+        cloudEtag = remoteEtag || cloudEtag || null;
+        saveCloudEtag(cloudEtag);
+
+        // دمج ذكي: المحلي + السحابي
+        data = mergeRows(data, remoteRows);
+        saveLocalBackup();
+        try{ render(); }catch{}
+        continue; // أعد المحاولة فورًا
+      }
+
+      // في حال انقطع النت أثناء المحاولة
+      if(!navigator.onLine) throw e;
+
       // backoff بسيط
-      await new Promise(r=>setTimeout(r, 500*i));
+      await new Promise(r=>setTimeout(r, 450*i));
     }
   }
+
   throw lastErr || new Error("Firebase push failed");
 }
 
@@ -990,6 +1278,7 @@ async function syncPushNow(){
     lastSyncAt = nowHHMM();
     setSyncState("ok");
     markPendingSync(false);
+    render();
   }catch(e){
     setSyncState("fail");
     // نترك pending = true ليُعاد الإرسال لاحقًا
@@ -1008,17 +1297,27 @@ async function syncPullNow(){
   try{
     setSyncState("saving");
 
-    // إذا لدينا تغييرات محلية غير مرفوعة: اسأل قبل الاستبدال
+    const remote = await firebasePull(); // ✅ يُحدّث cloudEtag أيضًا
+
     if(hasPendingSync()){
-      const ok = confirm("لديك تغييرات محلية غير مرفوعة. هل تريد استبدالها بالنسخة السحابية؟");
-      if(!ok){
-        setSyncState("ok");
-        return;
-      }
+      // ✅ Stage 2: دمج بدل الاستبدال (يحافظ على تعديلاتك الأوفلاين)
+      const local = Array.isArray(data) ? data : loadLocalBackup();
+      data = mergeRows(local, remote);
+      saveLocalBackup();
+      render();
+
+      // بعد الدمج: ادفع النتيجة للسحابة لتوحيد الجميع
+      await firebasePushRetry(4);
+      lastSyncAt = nowHHMM();
+      setSyncState("ok");
       markPendingSync(false);
+      render();
+
+      try{ showToast("✅ تم الجلب + الدمج", "تمت مزامنة تعديلاتك مع السحابة", "ok"); }catch{}
+      return;
     }
 
-    const remote = await firebasePull();
+    // لا يوجد pending: حمّل السحابة كما هي
     data = Array.isArray(remote) ? remote : [];
     saveLocalBackup();
     lastSyncAt = nowHHMM();
@@ -1035,32 +1334,47 @@ async function syncPullNow(){
 // عند فتح الصفحة: إن كان لا يوجد تعديل محلي معلّق، اسحب من Firebase.
 // إذا يوجد تعديل معلّق (عملت أوفلاين)، نُبقي المحلي ونحاول دفعه فور توفر النت.
 async function initialLoad(){
-  if(navigator.onLine){
+  const local = loadLocalBackup();
+
+  if(!navigator.onLine){
+    setSyncState("offline");
+    data = local;
+    return;
+  }
+
+  try{
+    setSyncState("saving");
+
+    const remote = await firebasePull(); // ✅ يحدّث ETag
+
     if(hasPendingSync()){
-      // لدينا تغييرات محلية لم تُرفع بعد
-      data = loadLocalBackup();
-      setSyncState("offline"); // يظهر أنه سيُزامن عند توفر النت
-      scheduleSyncPush(0);
-      return;
-    }
-    try{
-      setSyncState("saving");
-      data = await firebasePull();
+      // ✅ لدينا تعديلات محلية: ادمج ثم ادفع (بدل overwrite)
+      data = mergeRows(local, remote);
       saveLocalBackup();
+
+      await firebasePushRetry(4);
       lastSyncAt = nowHHMM();
       setSyncState("ok");
-      return;
-    }catch(e){
-      setSyncState("fail");
-      data = loadLocalBackup();
-      try{ showToast("تعذر جلب البيانات من Firebase", "تم تحميل النسخة المحلية", "warn"); }catch{}
+      markPendingSync(false);
       return;
     }
-  }else{
-    setSyncState("offline");
-    data = loadLocalBackup();
+
+    // لا يوجد pending: خذ السحابة
+    data = Array.isArray(remote) ? remote : [];
+    saveLocalBackup();
+    lastSyncAt = nowHHMM();
+    setSyncState("ok");
+    return;
+
+  }catch(e){
+    setSyncState("fail");
+    // fallback: المحلي
+    data = local;
+    try{ showToast("تعذر جلب البيانات من Firebase", "تم تحميل النسخة المحلية", "warn"); }catch{}
+    return;
   }
 }
+
 
 // مراقبة عودة النت: أعد الإرسال تلقائياً إن كان هناك pending
 function onOnlineMaybeSync(){
@@ -1340,11 +1654,25 @@ if(__restoreBtn){
 
 
 /* ===== Sync modal ===== */
-$("openSync").onclick = ()=> openModal("syncModal");
+$("openSync").onclick = ()=>{ try{ const inp = $("roomCode"); if(inp) inp.value = getRoomCode(); }catch{} openModal("syncModal"); };
+
+/* ===== Shared Room Code (مزامنة مشتركة) ===== */
+(function bindRoomCode(){
+  const inp = $("roomCode");
+  if(!inp) return;
+  try{ inp.value = getRoomCode(); }catch{}
+  inp.addEventListener("change", ()=>{
+    setRoomCode(inp.value);
+    cloudEtag = loadCloudEtag(); // ✅ ETag خاص بهذا الـ Room
+    inp.value = getRoomCode();
+    try{ showToast("✅ تم حفظ كود المجموعة", inp.value, "ok"); }catch{}
+  });
+})();
+
 // ===== Totals (💰 المجموع) =====
 function getFilteredRows(){
   const q = ($("search").value||"").trim().toLowerCase();
-  return (data||[]).filter(r=>{
+  return activeOnly(data||[]).filter(r=>{
     if(!q) return true;
     return (r.name||"").toLowerCase().includes(q) || (r.email||"").toLowerCase().includes(q);
   });
@@ -1353,6 +1681,7 @@ function getFilteredRows(){
 function computeTotalsGroups(list){
   const groups = {};
   for(const r of (list||[])){
+    if(r && (r.deleted || r._deleted)) continue;
     const c = r.currency || getCurrency();
     const p = Number(r.price ?? 0);
     if(!Number.isFinite(p) || p<=0) continue;
@@ -1466,7 +1795,7 @@ function buildShareText(list){
 async function doShare(){
   try{
     const q = ($("search").value||"").trim().toLowerCase();
-    const list = (data||[]).filter(r=>{
+    const list = activeOnly(data||[]).filter(r=>{
       if(!q) return true;
       return (r.name||"").toLowerCase().includes(q) || (r.email||"").toLowerCase().includes(q);
     });
@@ -1497,11 +1826,11 @@ function doPrint(){
   try{
     const d = new Date();
     const meta = document.getElementById("printMeta");
-    const total = (typeof data !== "undefined") ? data.length : 0;
+    const total = (typeof data !== "undefined") ? activeOnly(data).length : 0;
     const shown = (()=>{
       const q = ($("search").value||"").trim().toLowerCase();
       if(!q) return total;
-      return (data||[]).filter(r=> (r.name||"").toLowerCase().includes(q) || (r.email||"").toLowerCase().includes(q)).length;
+      return activeOnly(data||[]).filter(r=> (r.name||"").toLowerCase().includes(q) || (r.email||"").toLowerCase().includes(q)).length;
     })();
     if(meta){
       meta.textContent = `التاريخ: ${d.toLocaleDateString()} — الوقت: ${d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})} — الإجمالي: ${total} — المعروض: ${shown}`;
@@ -1513,7 +1842,7 @@ function doPrint(){
 }
 
 $("clearBtn").onclick = ()=>{
-  if(!data.length){
+  if(!activeOnly(data).length){
     showToast("لا توجد بيانات للحذف", "", "warn");
     return;
   }
@@ -1521,8 +1850,13 @@ $("clearBtn").onclick = ()=>{
 
   makeUndoSnapshot("clear_all");  // ✅ لقطة قبل الحذف
 
-  const count = data.length;
-  data=[];
+  const count = activeOnly(data).length;
+  const __now = Date.now();
+  data = (data||[]).map(r=>{
+    if(!r || typeof r !== 'object') return r;
+    if(r.deleted) return r;
+    return { ...r, deleted:true, updatedAt: __now, updatedBy: getDeviceId() };
+  });
   save();
   render();
 
@@ -1577,7 +1911,7 @@ function handleSaveClick(){
   if(!isFinite(price) || price < 0) return alert("السعر غير صحيح");
 
   // منع تكرار الإيميل
-  const existsIndex = data.findIndex(r => normalizeEmail(r.email) === email);
+  const existsIndex = data.findIndex(r => !r.deleted && normalizeEmail(r.email) === email);
   const isDuplicate = existsIndex >= 0 && (!editingId || data[existsIndex].id !== editingId);
   if(isDuplicate){
     haptic("fail");
@@ -1598,7 +1932,10 @@ function handleSaveClick(){
     price,
     currency,
     start,
-    end
+    end,
+    deleted: false,
+    updatedAt: Date.now(),
+    updatedBy: getDeviceId()
   };
 
   upsert(rec);
@@ -1625,7 +1962,7 @@ function downloadFile(filename, content, mime){
   URL.revokeObjectURL(url);
 }
 function buildBackupPayload(){
-  return { version: 1, exportedAt: new Date().toISOString(), alertDays: getStoredAlertDays(), data };
+  return { version: 2, exportedAt: new Date().toISOString(), alertDays: getStoredAlertDays(), data: activeOnly(data) };
 }
 
 $("exportJsonBtn").onclick = ()=>{
@@ -1673,7 +2010,10 @@ function importFromText(text){
     const rec = {
       id: r.id || (Date.now()+"_"+Math.random().toString(16).slice(2)),
       name: (r.name||"").trim(),
-      email, months, price, currency, start, end
+      email, months, price, currency, start, end,
+      deleted: false,
+      updatedAt: Date.now(),
+      updatedBy: getDeviceId()
     };
 
     const idx = data.findIndex(x=>normalizeEmail(x.email)===email);
@@ -1730,6 +2070,9 @@ $("actExtend").onclick = ()=>{
   const rec = data.find(x => x.id === currentRowId);
   if(!rec) return;
   rec.end = addMonths(rec.end, Number(rec.months));
+  rec.deleted = false;
+  rec.updatedAt = Date.now();
+  rec.updatedBy = getDeviceId();
   save();
   render();
   closeRowActions();
@@ -1744,7 +2087,9 @@ $("actDelete").onclick = ()=>{
 
   makeUndoSnapshot("delete_one"); // ✅ لقطة قبل الحذف
 
-  data = data.filter(x => x.id !== currentRowId);
+  rec.deleted = true;
+  rec.updatedAt = Date.now();
+  rec.updatedBy = getDeviceId();
   save();
   render();
   closeRowActions();
@@ -1816,6 +2161,7 @@ $("tbody").addEventListener("click",(e)=>{
 function computeTotalsText(list){
   const groups = {};
   for(const r of (list||[])){
+    if(r && (r.deleted || r._deleted)) continue;
     const c = r.currency || getCurrency();
     const p = Number(r.price ?? 0);
     if(!Number.isFinite(p) || p<=0) continue;
@@ -1841,11 +2187,11 @@ function render(){
   const alertDays = getStoredAlertDays();
 
   const allCounts={active:0, expiring:0, expired:0};
-  for(const r of data){
+  for(const r of activeOnly(data)){
     allCounts[status(r.end, alertDays).key]++;
   }
 
-  const rows = data.filter(r=>{
+  const rows = activeOnly(data).filter(r=>{
     if(!q) return true;
     return (r.name||"").toLowerCase().includes(q) || normalizeEmail(r.email).includes(q);
   });
@@ -1894,13 +2240,14 @@ function render(){
   if(bar){
     bar.innerHTML = `
       <div class="statChip"><span class="ico">👁️</span><span class="k">المعروض</span><span class="v">${rows.length}</span></div>
-      <div class="statChip"><span class="ico">📦</span><span class="k">الإجمالي</span><span class="v">${data.length}</span></div>
+      <div class="statChip"><span class="ico">📦</span><span class="k">الإجمالي</span><span class="v">${activeOnly(data).length}</span></div>
       <div class="statChip"><span class="ico">💰</span><span class="k">مجموع</span><span class="v">${escapeHtml(sumAll.text)}</span></div>
       <div class="statChip"><span class="ico">🧾</span><span class="k">مجموع المعروض</span><span class="v">${escapeHtml(sumShown.text)}</span></div>
       <div class="statChip ok"><span class="ico">✅</span><span class="k">فعّال</span><span class="v">${allCounts.active}</span></div>
       <div class="statChip warn"><span class="ico">⏰</span><span class="k">قريب</span><span class="v">${allCounts.expiring}</span></div>
       <div class="statChip err"><span class="ico">❌</span><span class="k">منتهي</span><span class="v">${allCounts.expired}</span></div>
       <div class="statChip sync" id="syncChip"><span class="ico">☁️</span><span class="k">مزامنة</span><span class="v" id="syncVal">${getSyncText()}</span></div>
+      <div class="statChip sync"><span class="ico">👥</span><span class="k">غرفة</span><span class="v">${escapeHtml(getRoomCode())}</span></div>
     `;
   }
   }
@@ -1908,6 +2255,7 @@ function render(){
 
 /* init */
 (async ()=>{
+  try{ initAuth(); }catch{}
   await load();
   render();
 })();
