@@ -352,6 +352,18 @@ tr.expiring-row td:first-child{ box-shadow: inset 4px 0 0 rgba(245,158,11,.85); 
 .syncBtn:active{ transform: scale(.99); }
 .syncBtn.link{ cursor:pointer; }
 
+
+.syncBtn.primary{
+  border-color: rgba(124,92,255,.45);
+  background: rgba(124,92,255,.10);
+}
+.syncBtn.danger{
+  border-color: rgba(239,68,68,.45);
+  background: rgba(239,68,68,.20);
+}
+.syncBtn.danger:hover{ background: rgba(239,68,68,.28); }
+
+
 .syncHr{
   height:1px;
   background: rgba(255,255,255,.10);
@@ -747,6 +759,14 @@ tr.expiring-row td:first-child{ box-shadow: inset 4px 0 0 rgba(245,158,11,.85); 
         <button class="syncBtn" id="syncRestorePick" type="button">⬇️ جلب من السحابة</button>
       </div>
 
+      <div class="note" style="margin-top:10px">
+        <b>Live Sync:</b> عند تفعيلها، أي تعديل من أي جهاز داخل نفس <b>Room</b> يظهر تلقائيًا هنا (بدون سحب يدوي).
+      </div>
+
+      <div class="syncGrid" style="margin-top:10px">
+        <button class="syncBtn primary" id="liveToggleBtn" type="button">🟢 تفعيل المزامنة اللحظية</button>
+      </div>
+
       <div class="syncHr"></div>
 
       <div class="syncSectionTitle">☁️ خدمات التخزين</div>
@@ -796,7 +816,7 @@ tr.expiring-row td:first-child{ box-shadow: inset 4px 0 0 rgba(245,158,11,.85); 
 
 <script>
 'use strict';
-const APP_VERSION = 'v1.4.5';
+const APP_VERSION = 'Stage3 – v1.4.5';
 const DEBUG = false;
 const log = (...a)=>{ if(DEBUG) console.log('[APP]', ...a); };
 
@@ -824,6 +844,7 @@ function initAuth(){
     auth.onAuthStateChanged((u)=>{
       currentUser = u || null;
       updateAuthUI();
+      try{ restartLiveIfNeeded && restartLiveIfNeeded(); }catch{}
     });
     authReady = true;
     updateAuthUI();
@@ -886,6 +907,133 @@ function getFirebasePath(){
   return `rooms/${getRoomCode()}/subscriptions`;
 }
 /* =========================================================
+
+/* =========================================================
+   🟢 Stage 3: Live Sync (Realtime Streaming)
+   - تشغيل/إيقاف من نافذة المزامنة
+   - يستعمل Firebase REST Streaming (SSE عبر EventSource)
+   - عند أي تغيير: نسحب Snapshot ثم نُطبق نفس دمج المرحلة 2 (ETag + merge)
+========================================================= */
+const LIVE_SYNC_KEY = "subs_live_sync_v1";
+let liveSource = null;
+let liveConnected = false;
+let liveDebounce = null;
+
+function isLiveEnabled(){
+  try{ return localStorage.getItem(LIVE_SYNC_KEY) === "1"; }catch{ return false; }
+}
+function setLiveEnabled(on, silent=false){
+  try{ localStorage.setItem(LIVE_SYNC_KEY, on ? "1" : "0"); }catch{}
+  updateLiveBtn();
+  if(on) startLiveListener();
+  else stopLiveListener();
+  setSyncState(syncState);
+  if(!silent){
+    try{ showToast(on ? "🟢 تم تفعيل المزامنة اللحظية" : "⏹ تم إيقاف المزامنة اللحظية", "", "ok"); }catch{}
+  }
+}
+
+function updateLiveBtn(){
+  const b = document.getElementById("liveToggleBtn");
+  if(!b) return;
+  const on = isLiveEnabled();
+  b.textContent = on ? "⏹ إيقاف المزامنة اللحظية" : "🟢 تفعيل المزامنة اللحظية";
+  b.classList.toggle("danger", on);
+  b.classList.toggle("primary", !on);
+  b.style.opacity = (!navigator.onLine && on) ? ".75" : "1";
+}
+
+async function getAuthTokenSafe(){
+  try{
+    return (currentUser && currentUser.getIdToken) ? await currentUser.getIdToken().catch(()=>null) : null;
+  }catch{ return null; }
+}
+
+function scheduleLivePull(){
+  if(liveDebounce) clearTimeout(liveDebounce);
+  liveDebounce = setTimeout(()=>{
+    // سحب صامت لتحديث الواجهة بدون إزعاج
+    syncPullNow({silent:true, fromLive:true});
+  }, 650);
+}
+
+async function startLiveListener(){
+  if(!isLiveEnabled()) return;
+  if(liveSource) return;
+
+  if(!navigator.onLine){
+    liveConnected = false;
+    updateLiveBtn();
+    setSyncState(syncState);
+    return;
+  }
+
+  const room = getRoomCode && getRoomCode();
+  if(!room){
+    setLiveEnabled(false, true);
+    try{ showToast("أدخل كود Room أولاً", "ثم فعّل Live Sync", "warn"); }catch{}
+    return;
+  }
+
+  const token = await getAuthTokenSafe();
+  const url = new URL(`${FIREBASE_URL}/${getFirebasePath()}.json`);
+  if(token) url.searchParams.set("auth", token);
+
+  try{
+    liveSource = new EventSource(url.toString());
+  }catch(e){
+    liveSource = null;
+    liveConnected = false;
+    setLiveEnabled(false, true);
+    try{ showToast("تعذر تشغيل Live Sync", String(e?.message||e), "err"); }catch{}
+    return;
+  }
+
+  const onAny = ()=> scheduleLivePull();
+
+  liveSource.addEventListener("open", ()=>{
+    liveConnected = true;
+    updateLiveBtn();
+    setSyncState(syncState);
+  });
+
+  liveSource.addEventListener("error", ()=>{
+    // EventSource يحاول إعادة الاتصال تلقائيًا
+    liveConnected = false;
+    updateLiveBtn();
+    setSyncState(syncState);
+  });
+
+  // Firebase يرسل put/patch
+  liveSource.addEventListener("put", onAny);
+  liveSource.addEventListener("patch", onAny);
+
+  // fallback
+  liveSource.onmessage = onAny;
+}
+
+function stopLiveListener(){
+  try{
+    if(liveSource){
+      liveSource.close();
+      liveSource = null;
+    }
+  }catch{}
+  liveConnected = false;
+  updateLiveBtn();
+  setSyncState(syncState);
+}
+
+// عند تغيّر Room أو تسجيل الدخول: أعد تشغيل Live إن كانت مفعلة
+function restartLiveIfNeeded(){
+  if(!isLiveEnabled()) return;
+  stopLiveListener();
+  startLiveListener();
+}
+
+// ربط online/offline مع Live
+window.addEventListener("online", ()=> { if(isLiveEnabled()) startLiveListener(); });
+window.addEventListener("offline", ()=> { if(isLiveEnabled()) stopLiveListener(); });
    ✅ Stage 2: دمج ذكي + حماية تعارض (ETag / If-Match)
    - نستعمل Conditional REST Requests في Realtime Database
    - نقرأ ETag عبر X-Firebase-ETag: true
@@ -937,12 +1085,24 @@ function nowHHMM(){
 }
 
 function getSyncText(){
-  if(!navigator.onLine) return "📴 أوفلاين";
-  if(syncState === "saving") return "⏳ جارٍ المزامنة...";
-  if(syncState === "ok") return `✅ تمت (${lastSyncAt || ""})`;
-  if(syncState === "fail") return "🔴 فشل";
-  return "—";
+  // حالة المزامنة الأساسية
+  let base = "—";
+  if(!navigator.onLine) base = "📴 أوفلاين";
+  else if(syncState === "saving") base = "⏳ جارٍ المزامنة...";
+  else if(syncState === "ok") base = `✅ تمت (${lastSyncAt || ""})`;
+  else if(syncState === "fail") base = "🔴 فشل";
+
+  // حالة Live Sync (المرحلة 3)
+  try{
+    const on = isLiveEnabled && isLiveEnabled();
+    if(on){
+      const s = (typeof liveConnected !== "undefined" && liveConnected) ? "🟢 Live" : "🟡 Live";
+      base = `${base} · ${s}`;
+    }
+  }catch{}
+  return base;
 }
+
 
 function setSyncState(state){
   syncState = state;
@@ -1287,10 +1447,12 @@ async function syncPushNow(){
 }
 
 // سحب يدوي من Firebase (Restore)
-async function syncPullNow(){
+async function syncPullNow(opts={}){
+  const silent = !!opts.silent;
+  const fromLive = !!opts.fromLive;
   if(!navigator.onLine){
     setSyncState("offline");
-    try{ showToast("أنت أوفلاين", "شغّل الإنترنت ثم أعد المحاولة", "warn"); }catch{}
+    if(!silent) try{ showToast("أنت أوفلاين", "شغّل الإنترنت ثم أعد المحاولة", "warn"); }catch{}
     return;
   }
 
@@ -1313,7 +1475,7 @@ async function syncPullNow(){
       markPendingSync(false);
       render();
 
-      try{ showToast("✅ تم الجلب + الدمج", "تمت مزامنة تعديلاتك مع السحابة", "ok"); }catch{}
+      if(!silent) try{ showToast("✅ تم الجلب + الدمج", "تمت مزامنة تعديلاتك مع السحابة", "ok"); }catch{}
       return;
     }
 
@@ -1323,10 +1485,10 @@ async function syncPullNow(){
     lastSyncAt = nowHHMM();
     setSyncState("ok");
     render();
-    try{ showToast("✅ تم الاسترجاع", "تم تحميل البيانات من السحابة", "ok"); }catch{}
+    if(!silent) try{ showToast("✅ تم الاسترجاع", "تم تحميل البيانات من السحابة", "ok"); }catch{}
   }catch(e){
     setSyncState("fail");
-    try{ showToast("تعذر الاسترجاع من Firebase", String(e?.message || e), "err"); }catch{}
+    if(!silent) try{ showToast("تعذر الاسترجاع من Firebase", String(e?.message || e), "err"); }catch{}
   }
 }
 
@@ -1370,7 +1532,7 @@ async function initialLoad(){
     setSyncState("fail");
     // fallback: المحلي
     data = local;
-    try{ showToast("تعذر جلب البيانات من Firebase", "تم تحميل النسخة المحلية", "warn"); }catch{}
+    if(!silent) try{ showToast("تعذر جلب البيانات من Firebase", "تم تحميل النسخة المحلية", "warn"); }catch{}
     return;
   }
 }
@@ -1666,6 +1828,7 @@ $("openSync").onclick = ()=>{ try{ const inp = $("roomCode"); if(inp) inp.value 
     cloudEtag = loadCloudEtag(); // ✅ ETag خاص بهذا الـ Room
     inp.value = getRoomCode();
     try{ showToast("✅ تم حفظ كود المجموعة", inp.value, "ok"); }catch{}
+    try{ restartLiveIfNeeded && restartLiveIfNeeded(); }catch{}
   });
 })();
 
@@ -2122,6 +2285,17 @@ $("actCopyEmail").onclick = async ()=>{
 /* ===== Sync modal buttons ===== */
 $("syncBackupDownload").onclick = ()=> syncPushNow();
 $("syncRestorePick").onclick = ()=> syncPullNow();
+
+// Live Sync toggle (Stage 3)
+const __liveBtn = document.getElementById("liveToggleBtn");
+if(__liveBtn){
+  __liveBtn.onclick = ()=>{
+    const on = isLiveEnabled();
+    setLiveEnabled(!on);
+  };
+}
+updateLiveBtn();
+
 
 $("syncBackupShare").onclick = async ()=>{
   const payload = buildBackupPayload();
