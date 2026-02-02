@@ -775,6 +775,56 @@ tr.expiring-row td:first-child{ box-shadow: inset 4px 0 0 rgba(245,158,11,.85); 
   </div>
 </div>
 
+
+<!-- ===== Modal: تجديد (خيارات) ===== -->
+<div class="modal" id="renewModal" aria-hidden="true">
+  <div class="box" role="dialog" aria-modal="true" style="width:min(760px, 100%)">
+    <div class="modalHeader">
+      <div>
+        <h2>🔁 تجديد الاشتراك</h2>
+        <div class="hint" id="renewHint">—</div>
+      </div>
+      <button class="btn" id="closeRenewX" type="button">✕</button>
+    </div>
+
+    <div class="modalBody">
+      <div class="field" style="margin-bottom:10px">
+        <label>عدد الأشهر (كل شهر = 30 يوم)</label>
+        <input id="renewMonths" type="number" min="1" step="1" placeholder="مثال: 1 / 3 / 6 / 12">
+      </div>
+
+      <div class="note" style="margin-top:0">
+        <b>اختيارات سريعة:</b>
+        <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px">
+          <button class="btn soft" type="button" data-renew="1">1 شهر</button>
+          <button class="btn soft" type="button" data-renew="3">3 أشهر</button>
+          <button class="btn soft" type="button" data-renew="6">6 أشهر</button>
+          <button class="btn soft" type="button" data-renew="12">12 شهر</button>
+        </div>
+      </div>
+
+      <div class="note">
+        <label style="display:flex; gap:10px; align-items:center; cursor:pointer; user-select:none">
+          <input id="renewFromToday" type="checkbox" style="width:18px;height:18px">
+          <span><b>ابدأ من اليوم</b> (بدل الإضافة على تاريخ الانتهاء الحالي)</span>
+        </label>
+        <div style="margin-top:8px;opacity:.9">
+          • إذا لم تحددها: سيتم <b>تمديد</b> نهاية الاشتراك فقط.<br>
+          • إذا حددتها: سيتم ضبط <b>البداية = اليوم</b> واحتساب نهاية جديدة.
+        </div>
+      </div>
+
+      <div class="note" id="renewPreview">—</div>
+    </div>
+
+    <div class="modalFooter">
+      <button class="btn primary" id="confirmRenew" type="button">✅ تطبيق التجديد</button>
+      <button class="btn" id="closeRenew" type="button">إلغاء</button>
+    </div>
+  </div>
+</div>
+
+
 <!-- ===== Modal: المزامنة والنسخ الاحتياطي ===== -->
 <div class="modal" id="syncModal" aria-hidden="true">
   <div class="box" role="dialog" aria-modal="true" style="width:min(760px, 100%)">
@@ -1741,12 +1791,14 @@ function toDate(iso){
   const d=new Date(iso+"T00:00:00"); d.setHours(0,0,0,0);
   return d;
 }
-function addMonths(dateISO, m){
-  const d=toDate(dateISO);
-  const day=d.getDate();
-  d.setMonth(d.getMonth()+m);
-  if(d.getDate() < day) d.setDate(0);
+function addDays(dateISO, days){
+  const d = toDate(dateISO);
+  d.setDate(d.getDate() + Number(days||0));
   return d.toISOString().slice(0,10);
+}
+// ✅ شهر ثابت = 30 يوم (بغض النظر عن 28/31)
+function addMonths(dateISO, m){
+  return addDays(dateISO, Number(m||0) * 30);
 }
 function normalizeEmail(e){ return (e||"").trim().toLowerCase(); }
 function validateEmail(e){ return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
@@ -2526,6 +2578,106 @@ function csvCell(v){
 /* ===== Actions Modal (للجدول فقط) ===== */
 let currentRowId = null;
 
+// ===== Renew (Options) =====
+let renewTargetId = null;
+
+function fmtISO(iso){
+  try{
+    const d = new Date(String(iso||"") + "T00:00:00");
+    return d.toLocaleDateString();
+  }catch{ return iso || "—"; }
+}
+
+function computeRenewPreview(rec, months, fromToday){
+  const m = Number(months||0);
+  if(!rec || !m || m<1) return "—";
+  const base = fromToday ? todayISO() : (rec.end || todayISO());
+  const newEnd = addMonths(base, m);
+  if(fromToday){
+    return `سيتم ضبط البداية: ${base} (${fmtISO(base)}) — النهاية: ${newEnd} (${fmtISO(newEnd)})`;
+  }
+  return `سيتم تمديد النهاية من: ${rec.end} (${fmtISO(rec.end)}) إلى: ${newEnd} (${fmtISO(newEnd)})`;
+}
+
+function openRenewModal(id){
+  const rec = (data||[]).find(x => x.id === id);
+  if(!rec) return;
+
+  renewTargetId = id;
+  try{ $("renewHint").textContent = `${rec.name || "—"} — ${rec.email || "—"}`; }catch{}
+  try{ $("renewMonths").value = String(Number(rec.months||1) || 1); }catch{}
+  try{ $("renewFromToday").checked = false; }catch{}
+  try{ $("renewPreview").textContent = computeRenewPreview(rec, $("renewMonths").value, $("renewFromToday").checked); }catch{}
+
+  openModal("renewModal");
+}
+
+function closeRenewModal(){
+  closeModal("renewModal");
+  renewTargetId = null;
+}
+
+function applyRenew(){
+  const rec = (data||[]).find(x => x.id === renewTargetId);
+  if(!rec) return;
+
+  const months = Number($("renewMonths").value);
+  if(!months || months<1){
+    haptic("fail");
+    showToast("أدخل عدد أشهر صحيح", "", "err");
+    return;
+  }
+
+  const fromToday = !!$("renewFromToday").checked;
+  if(fromToday){
+    rec.start = todayISO();
+    rec.end = addMonths(rec.start, months);
+  }else{
+    rec.end = addMonths(rec.end, months);
+  }
+
+  rec.months = months;         // حفظ اختيار المستخدم
+  rec.deleted = false;         // لو كان محذوف (soft) يرجعه
+  rec.updatedAt = Date.now();
+  rec.updatedBy = getDeviceId();
+  rec.updatedByName = getDeviceLabel();
+
+  save();
+  render();
+  closeRenewModal();
+  closeRowActions();
+  haptic("ok");
+  showToast("✅ تم التجديد", "", "ok");
+}
+
+// Bind Renew Modal UI
+document.addEventListener("click", (e)=>{
+  const b = e.target.closest("button[data-renew]");
+  if(!b) return;
+  try{
+    const v = b.getAttribute("data-renew");
+    if(v) $("renewMonths").value = v;
+    const rec = (data||[]).find(x => x.id === renewTargetId);
+    $("renewPreview").textContent = computeRenewPreview(rec, $("renewMonths").value, $("renewFromToday").checked);
+  }catch{}
+});
+
+try{
+  $("closeRenewX").onclick = closeRenewModal;
+  $("closeRenew").onclick  = closeRenewModal;
+  $("confirmRenew").onclick = applyRenew;
+
+  $("renewMonths").addEventListener("input", ()=>{
+    const rec = (data||[]).find(x => x.id === renewTargetId);
+    $("renewPreview").textContent = computeRenewPreview(rec, $("renewMonths").value, $("renewFromToday").checked);
+  });
+  $("renewFromToday").addEventListener("change", ()=>{
+    const rec = (data||[]).find(x => x.id === renewTargetId);
+    $("renewPreview").textContent = computeRenewPreview(rec, $("renewMonths").value, $("renewFromToday").checked);
+  });
+}catch{}
+
+
 function openRowActions(id){
   currentRowId = id;
   const rec = data.find(x => x.id === id);
@@ -2551,16 +2703,7 @@ $("actEdit").onclick = ()=>{
 };
 
 $("actExtend").onclick = ()=>{
-  const rec = data.find(x => x.id === currentRowId);
-  if(!rec) return;
-  rec.end = addMonths(rec.end, Number(rec.months));
-  rec.deleted = false;
-  rec.updatedAt = Date.now();
-  rec.updatedBy = getDeviceId();
-  rec.updatedByName = getDeviceLabel();
-  save();
-  render();
-  closeRowActions();
+  openRenewModal(currentRowId);
 };
 
 /* ✅ حذف سجل: الآن مع Undo */
