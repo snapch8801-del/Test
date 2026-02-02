@@ -665,6 +665,16 @@ tr.expiring-row td:first-child{ box-shadow: inset 4px 0 0 rgba(245,158,11,.85); 
             <button class="btn soft" id="restoreLastDeleteBtn" type="button">استرجاع</button>
           </div>
         </div>
+        <div class="backTile">
+          <div class="t">⏱️ النسخ التلقائي (كل 10 دقائق)</div>
+          <div class="d">استرجاع نسخة تلقائية من الذاكرة المحلية (تُدمج تلقائيًا مع السابقة).</div>
+          <div class="actions">
+            <button class="btn soft" id="restoreLastAutoSnapBtn" type="button">استرجاع آخر نسخة</button>
+            <button class="btn soft" id="openAutoSnapListBtn" type="button">عرض النسخ</button>
+            <button class="btn soft" id="mergeLastAutoSnapBtn" type="button">دمج آخر نسخة</button>
+          </div>
+        </div>
+
 
       </div>
 
@@ -675,6 +685,41 @@ tr.expiring-row td:first-child{ box-shadow: inset 4px 0 0 rgba(245,158,11,.85); 
 
     <div class="modalFooter">
       <button class="btn" id="closeBackup2" type="button">إغلاق</button>
+    </div>
+  </div>
+</div>
+
+
+
+<!-- Modal: Auto Snapshots -->
+<div class="modal" id="autoSnapModal" aria-hidden="true">
+  <div class="box" role="dialog" aria-modal="true" style="width:min(760px, 100%)">
+    <div class="modalHeader">
+      <div>
+        <h2>⏱️ النسخ التلقائي</h2>
+        <div class="hint">اختر نسخة تلقائية محفوظة محليًا ثم استرجعها</div>
+      </div>
+      <button class="btn" id="closeAutoSnapX" type="button">✕</button>
+    </div>
+
+    <div class="modalBody">
+      <div class="field">
+        <label>النسخ المتاحة (لهذه الغرفة)</label>
+        <select id="autoSnapSelect"></select>
+      </div>
+
+      <div class="note" id="autoSnapInfo" style="margin-top:10px">—</div>
+
+      <div class="note" style="margin-top:10px">
+        <b>ملاحظة:</b> يمكنك الاسترجاع (استبدال) أو الدمج مع البيانات الحالية. في الدمج: الأحدث حسب <b>updatedAt</b> يفوز.
+      </div>
+    </div>
+
+    <div class="modalFooter">
+      <button class="btn primary" id="restoreAutoSnapSelectedBtn" type="button">↩️ استرجاع النسخة المحددة</button>
+      <button class="btn soft" id="mergeAutoSnapSelectedBtn" type="button">🔀 دمج النسخة المحددة</button>
+      <button class="btn danger" id="deleteRoomAutoSnapsBtn" type="button">🗑️ حذف نسخ هذه الغرفة</button>
+      <button class="btn" id="closeAutoSnap" type="button">إغلاق</button>
     </div>
   </div>
 </div>
@@ -1100,6 +1145,102 @@ let cloudEtag = loadCloudEtag();
 
 const LOCAL_BACKUP_KEY   = "subs_local_backup_v3";
 const PENDING_SYNC_KEY   = "subs_pending_sync_v1";
+
+// ===== Auto Snapshots (Local, every 10 minutes, merged) =====
+const AUTO_SNAP_KEY = "subs_autosnapshots_v1";
+const AUTO_SNAP_EVERY_MS = 10 * 60 * 1000; // 10 minutes
+const AUTO_SNAP_MAX = 144; // keep last 24 hours (144 * 10min)
+let autoSnapTimer = null;
+
+function loadAutoSnaps(){
+  try{
+    const raw = localStorage.getItem(AUTO_SNAP_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  }catch{ return []; }
+}
+function saveAutoSnaps(list){
+  try{ localStorage.setItem(AUTO_SNAP_KEY, JSON.stringify(list)); }catch{}
+}
+
+// Merge by id (preferred) then by email. Newer updatedAt wins; older fills missing fields.
+function mergeRows(baseRows, incomingRows){
+  const out = new Map();
+
+  const normEmail = (e)=>{
+    try{
+      return (typeof normalizeEmail === "function") ? normalizeEmail(e) : String(e||"").trim().toLowerCase();
+    }catch{
+      return String(e||"").trim().toLowerCase();
+    }
+  };
+
+  const keyOf = (r)=>{
+    if(!r) return "";
+    if(r.id) return "id:" + String(r.id);
+    const em = normEmail(r.email);
+    return em ? ("em:" + em) : ("obj:" + Math.random().toString(16).slice(2));
+  };
+
+  const put = (r)=>{
+    if(!r) return;
+    const k = keyOf(r);
+    const prev = out.get(k);
+    if(!prev){
+      out.set(k, {...r});
+      return;
+    }
+    const ta = Number(prev.updatedAt || 0);
+    const tb = Number(r.updatedAt || 0);
+
+    if(tb > ta){
+      // incoming newer: take it, but keep any older-only fields
+      out.set(k, {...prev, ...r});
+    }else if(tb < ta){
+      // prev newer: keep it, but fill any missing fields from incoming
+      out.set(k, {...r, ...prev});
+    }else{
+      // same timestamp: incoming wins
+      out.set(k, {...prev, ...r});
+    }
+  };
+
+  (baseRows||[]).forEach(put);
+  (incomingRows||[]).forEach(put);
+
+  return Array.from(out.values());
+}
+
+function takeAutoSnapshot(reason="auto"){
+  try{
+    const list = loadAutoSnaps();
+    const prev = (list.length && list[list.length-1] && Array.isArray(list[list.length-1].data))
+      ? list[list.length-1].data
+      : [];
+    const merged = mergeRows(prev, (data||[]));
+    list.push({ at: Date.now(), room: (typeof getRoomCode==="function" ? getRoomCode() : "main"), reason, data: merged });
+
+    while(list.length > AUTO_SNAP_MAX) list.shift();
+    saveAutoSnaps(list);
+    return true;
+  }catch(e){
+    return false;
+  }
+}
+
+function startAutoSnapshots(){
+  stopAutoSnapshots();
+  // snapshot at start (merged), then every 10 minutes
+  takeAutoSnapshot("start");
+  autoSnapTimer = setInterval(()=> takeAutoSnapshot("auto"), AUTO_SNAP_EVERY_MS);
+}
+function stopAutoSnapshots(){
+  if(autoSnapTimer){
+    clearInterval(autoSnapTimer);
+    autoSnapTimer = null;
+  }
+}
+
 
 let syncState = "idle"; // idle | saving | ok | fail | offline
 let lastSyncAt = null;
@@ -1673,10 +1814,10 @@ function save(){
 function openModal(id){ $(id).setAttribute("aria-hidden","false"); }
 function closeModal(id){ $(id).setAttribute("aria-hidden","true"); }
 function closeAllModals(){
-  ["formModal","backupModal","pasteModal","rowActionsModal","syncModal","authModal"].forEach((m)=>{ try{ closeModal(m); }catch{} });
+  ["formModal","backupModal","pasteModal","rowActionsModal","syncModal","authModal","autoSnapModal"].forEach((m)=>{ try{ closeModal(m); }catch{} });
 }
 
-["formModal","backupModal","pasteModal","rowActionsModal","syncModal","authModal"].forEach(mid=>{
+["formModal","backupModal","pasteModal","rowActionsModal","syncModal","authModal","autoSnapModal"].forEach(mid=>{
   const el = $(mid);
   if(!el) return;
   el.addEventListener("click",(e)=>{ if(e.target.id===mid) closeModal(mid); });
@@ -1823,6 +1964,7 @@ $("quickPlan").onchange = ()=>{ const v = $("quickPlan").value; if(v) $("months"
 /* ===== Backup modal ===== */
 $("openBackup").onclick = ()=>{
   openModal("backupModal");
+  try{ refreshAutoSnapUI(); }catch{}
   try{
     const snap = getUndoSnapshot();
     const b = $("restoreLastDeleteBtn");
@@ -1831,6 +1973,154 @@ $("openBackup").onclick = ()=>{
 };
 $("closeBackup").onclick = ()=> closeModal("backupModal");
 $("closeBackup2").onclick = ()=> closeModal("backupModal");
+
+
+
+/* ===== Auto Snapshots UI (نسخ تلقائي) ===== */
+function _autoSnapsForCurrentRoom(){
+  const room = (typeof getRoomCode==="function") ? getRoomCode() : "main";
+  return loadAutoSnaps().filter(s => (s && (s.room||"main")===room && Array.isArray(s.data)));
+}
+function _fmtWhen(ts){
+  try{
+    const d = new Date(Number(ts||0));
+    if(!Number.isFinite(d.getTime())) return "—";
+    return d.toLocaleString();
+  }catch{ return "—"; }
+}
+function refreshAutoSnapUI(){
+  const list = _autoSnapsForCurrentRoom();
+  const btnLast = document.getElementById("restoreLastAutoSnapBtn");
+  const btnOpen = document.getElementById("openAutoSnapListBtn");
+  if(btnLast){ btnLast.disabled = list.length===0; btnLast.style.opacity = list.length?"1":".55"; }
+  if(btnOpen){ btnOpen.disabled = list.length===0; btnOpen.style.opacity = list.length?"1":".55"; }
+}
+function fillAutoSnapSelect(){
+  const sel = document.getElementById("autoSnapSelect");
+  const info = document.getElementById("autoSnapInfo");
+  if(!sel || !info) return;
+  const list = _autoSnapsForCurrentRoom();
+  sel.innerHTML = "";
+  if(list.length===0){
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "لا توجد نسخ";
+    sel.appendChild(opt);
+    info.textContent = "—";
+    return;
+  }
+  // newest first
+  const rev = list.slice().reverse();
+  rev.forEach((s, idx)=>{
+    const opt = document.createElement("option");
+    opt.value = String(idx);
+    const count = Array.isArray(s.data) ? s.data.length : 0;
+    opt.textContent = `${_fmtWhen(s.at)} — ${count} سجل`;
+    sel.appendChild(opt);
+  });
+  const updateInfo = ()=>{
+    const i = Number(sel.value||0);
+    const snap = rev[i];
+    const count = Array.isArray(snap?.data) ? snap.data.length : 0;
+    info.innerHTML = `🕒 ${escapeHtml(_fmtWhen(snap?.at))}<br>📦 السجلات: <b>${count}</b><br>🧾 السبب: ${escapeHtml(String(snap?.reason||"auto"))}`;
+  };
+  sel.onchange = updateInfo;
+  sel.value = "0";
+  updateInfo();
+}
+function restoreAutoSnap(snap){
+  if(!snap || !Array.isArray(snap.data)){
+    showToast("لا توجد نسخة للاسترجاع", "", "err");
+    return;
+  }
+  data = snap.data;
+  save();
+  render();
+  showToast("✅ تم الاسترجاع من نسخة تلقائية", _fmtWhen(snap.at), "ok");
+}
+function restoreLastAutoSnap(){
+  const list = _autoSnapsForCurrentRoom();
+  if(!list.length){ showToast("لا توجد نسخ تلقائية", "", "warn"); return; }
+  const snap = list[list.length-1];
+  restoreAutoSnap(snap);
+}
+function mergeAutoSnap(snap){
+  if(!snap || !Array.isArray(snap.data)){
+    showToast("لا توجد نسخة للدمج", "", "err");
+    return;
+  }
+  try{
+    // دمج النسخة مع الحالي (الأحدث حسب updatedAt يفوز)
+    data = (typeof mergeRows === "function") ? mergeRows(data||[], snap.data||[]) : (snap.data||[]);
+  }catch(e){
+    // fallback: استبدال إن حدث خطأ غير متوقع
+    data = snap.data;
+  }
+  save();
+  render();
+  showToast("✅ تم دمج النسخة التلقائية", _fmtWhen(snap.at), "ok");
+}
+
+function mergeLastAutoSnap(){
+  const list = _autoSnapsForCurrentRoom();
+  if(!list.length){ showToast("لا توجد نسخ تلقائية", "", "warn"); return; }
+  const snap = list[list.length-1];
+  mergeAutoSnap(snap);
+}
+
+function deleteRoomAutoSnaps(){
+  const room = (typeof getRoomCode==="function") ? getRoomCode() : "main";
+  if(!confirm(`حذف كل النسخ التلقائية للغرفة: ${room} ؟`)) return;
+  const all = loadAutoSnaps();
+  const kept = all.filter(s => !(s && (s.room||"main")===room));
+  saveAutoSnaps(kept);
+  refreshAutoSnapUI();
+  try{ closeModal("autoSnapModal"); }catch{}
+  showToast("🗑️ تم حذف النسخ", room, "ok");
+}
+
+const __restoreAutoBtn = document.getElementById("restoreLastAutoSnapBtn");
+if(__restoreAutoBtn){
+  __restoreAutoBtn.onclick = ()=>{ restoreLastAutoSnap(); closeModal("backupModal"); };
+}
+const __mergeAutoBtn = document.getElementById("mergeLastAutoSnapBtn");
+if(__mergeAutoBtn){
+  __mergeAutoBtn.onclick = ()=>{ mergeLastAutoSnap(); closeModal("backupModal"); };
+}
+const __openAutoListBtn = document.getElementById("openAutoSnapListBtn");
+if(__openAutoListBtn){
+  __openAutoListBtn.onclick = ()=>{ fillAutoSnapSelect(); openModal("autoSnapModal"); };
+}
+
+const __closeAutoX = document.getElementById("closeAutoSnapX");
+if(__closeAutoX){ __closeAutoX.onclick = ()=> closeModal("autoSnapModal"); }
+const __closeAuto = document.getElementById("closeAutoSnap");
+if(__closeAuto){ __closeAuto.onclick = ()=> closeModal("autoSnapModal"); }
+const __restoreSel = document.getElementById("restoreAutoSnapSelectedBtn");
+if(__restoreSel){
+  __restoreSel.onclick = ()=>{
+    const list = _autoSnapsForCurrentRoom().slice().reverse();
+    const sel = document.getElementById("autoSnapSelect");
+    const idx = sel ? Number(sel.value||0) : 0;
+    const snap = list[idx];
+    restoreAutoSnap(snap);
+    closeModal("autoSnapModal");
+  };
+}
+const __mergeSel = document.getElementById("mergeAutoSnapSelectedBtn");
+if(__mergeSel){
+  __mergeSel.onclick = ()=>{
+    const list = _autoSnapsForCurrentRoom().slice().reverse();
+    const sel = document.getElementById("autoSnapSelect");
+    const idx = sel ? Number(sel.value||0) : 0;
+    const snap = list[idx];
+    mergeAutoSnap(snap);
+    closeModal("autoSnapModal");
+  };
+}
+const __delRoom = document.getElementById("deleteRoomAutoSnapsBtn");
+if(__delRoom){ __delRoom.onclick = ()=> deleteRoomAutoSnaps(); }
+/* ===== نهاية Auto Snapshots UI ===== */
 
 /* ✅ استرجاع آخر حذف من نافذة النسخ الاحتياطي */
 const __restoreBtn = $("restoreLastDeleteBtn");
@@ -2465,6 +2755,7 @@ function render(){
   try{ initAuth(); }catch{}
   await load();
   render();
+  try{ startAutoSnapshots(); }catch{}
 })();
 </script>
 
