@@ -1054,6 +1054,32 @@ function getDeviceId(){
   }
 }
 
+function autoDeviceLabel(){
+  try{
+    const ua = navigator.userAgent || "";
+    const plat = navigator.platform || "";
+    const isAndroid = /Android/i.test(ua);
+    const isIOS = /iPhone|iPad|iPod/i.test(ua);
+    const isWin = /Win/i.test(plat) || /Windows/i.test(ua);
+    const isMac = /Mac/i.test(plat) && !isIOS;
+
+    const os = isAndroid ? "Android" : isIOS ? "iOS" : isWin ? "Windows" : isMac ? "Mac" : "Device";
+    const br = /Edg/i.test(ua) ? "Edge" : /Chrome/i.test(ua) ? "Chrome" : /Firefox/i.test(ua) ? "Firefox" : /Safari/i.test(ua) ? "Safari" : "Browser";
+    return `${os}-${br}`;
+  }catch{
+    return "Device";
+  }
+}
+function getDeviceShort(){
+  const id = String(getDeviceId()||"");
+  return id.slice(-4).toUpperCase();
+}
+function getDeviceLabel(){
+  // اسم آلي + تمييز قصير
+  return `${autoDeviceLabel()} (${getDeviceShort()})`;
+}
+
+
 function getEtagKey(){
   return CLOUD_ETAG_PREFIX + getRoomCode();
 }
@@ -1272,6 +1298,7 @@ function buildCloudPayload(rows){
     v: 2,
     updatedAt: Date.now(),
     updatedBy: getDeviceId(),
+    updatedByName: getDeviceLabel(),
     rows: Array.isArray(rows) ? rows : []
   };
 }
@@ -2018,7 +2045,8 @@ $("clearBtn").onclick = ()=>{
   data = (data||[]).map(r=>{
     if(!r || typeof r !== 'object') return r;
     if(r.deleted) return r;
-    return { ...r, deleted:true, updatedAt: __now, updatedBy: getDeviceId() };
+    return { ...r, deleted:true, updatedAt: __now, updatedBy: getDeviceId(),
+    updatedByName: getDeviceLabel() };
   });
   save();
   render();
@@ -2098,7 +2126,8 @@ function handleSaveClick(){
     end,
     deleted: false,
     updatedAt: Date.now(),
-    updatedBy: getDeviceId()
+    updatedBy: getDeviceId(),
+    updatedByName: getDeviceLabel()
   };
 
   upsert(rec);
@@ -2176,7 +2205,8 @@ function importFromText(text){
       email, months, price, currency, start, end,
       deleted: false,
       updatedAt: Date.now(),
-      updatedBy: getDeviceId()
+      updatedBy: getDeviceId(),
+    updatedByName: getDeviceLabel()
     };
 
     const idx = data.findIndex(x=>normalizeEmail(x.email)===email);
@@ -2210,7 +2240,8 @@ function openRowActions(id){
   currentRowId = id;
   const rec = data.find(x => x.id === id);
   if(!rec) return;
-  $("rowActionsHint").textContent = `${rec.name} — ${rec.email}`;
+  const by = rec.updatedByName || (rec.updatedBy ? ("جهاز " + String(rec.updatedBy).slice(-4).toUpperCase()) : "—");
+  $("rowActionsHint").textContent = `${rec.name} — ${rec.email} — آخر تعديل: ${by}`;
   openModal("rowActionsModal");
   vibrateLight();
 }
@@ -2236,6 +2267,7 @@ $("actExtend").onclick = ()=>{
   rec.deleted = false;
   rec.updatedAt = Date.now();
   rec.updatedBy = getDeviceId();
+  rec.updatedByName = getDeviceLabel();
   save();
   render();
   closeRowActions();
@@ -2253,6 +2285,7 @@ $("actDelete").onclick = ()=>{
   rec.deleted = true;
   rec.updatedAt = Date.now();
   rec.updatedBy = getDeviceId();
+  rec.updatedByName = getDeviceLabel();
   save();
   render();
   closeRowActions();
