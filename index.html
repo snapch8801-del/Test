@@ -1034,7 +1034,7 @@ function restartLiveIfNeeded(){
 // ربط online/offline مع Live
 window.addEventListener("online", ()=> { if(isLiveEnabled()) startLiveListener(); });
 window.addEventListener("offline", ()=> { if(isLiveEnabled()) stopLiveListener(); });
-   ✅ Stage 2: دمج ذكي + حماية تعارض (ETag / If-Match)
+/* ✅ Stage 2: دمج ذكي + حماية تعارض (ETag / If-Match)
    - نستعمل Conditional REST Requests في Realtime Database
    - نقرأ ETag عبر X-Firebase-ETag: true
    - ونكتب بشرط if-match لتفادي "آخر كتابة تمسح التعديلات"
